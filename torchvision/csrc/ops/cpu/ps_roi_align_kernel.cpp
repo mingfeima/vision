@@ -1,4 +1,5 @@
 #include <ATen/ATen.h>
+#include <ATen/Parallel.h>
 #include <torch/library.h>
 
 namespace vision {
@@ -75,69 +76,71 @@ void ps_roi_align_forward_kernel_impl(
     int channels_out,
     T* output,
     int* channel_mapping) {
-  for (int n = 0; n < num_rois; n++) {
-    // [start, end) interval for spatial sampling
-    const T* offset_rois = rois + n * 5;
-    int roi_batch_ind = offset_rois[0];
+  at::parallel_for(0, num_rois, 1, [&](int begin, int end) {
+    for (int n = begin; n < end; n++) {
+      // [start, end) interval for spatial sampling
+      const T* offset_rois = rois + n * 5;
+      int roi_batch_ind = offset_rois[0];
 
-    // Do not using rounding; this implementation detail is critical
-    T roi_start_w = offset_rois[1] * spatial_scale - static_cast<T>(0.5);
-    T roi_start_h = offset_rois[2] * spatial_scale - static_cast<T>(0.5);
-    T roi_end_w = offset_rois[3] * spatial_scale - static_cast<T>(0.5);
-    T roi_end_h = offset_rois[4] * spatial_scale - static_cast<T>(0.5);
+      // Do not using rounding; this implementation detail is critical
+      T roi_start_w = offset_rois[1] * spatial_scale - static_cast<T>(0.5);
+      T roi_start_h = offset_rois[2] * spatial_scale - static_cast<T>(0.5);
+      T roi_end_w = offset_rois[3] * spatial_scale - static_cast<T>(0.5);
+      T roi_end_h = offset_rois[4] * spatial_scale - static_cast<T>(0.5);
 
-    T roi_width = roi_end_w - roi_start_w;
-    T roi_height = roi_end_h - roi_start_h;
-    T bin_size_h = static_cast<T>(roi_height) / static_cast<T>(pooled_height);
-    T bin_size_w = static_cast<T>(roi_width) / static_cast<T>(pooled_width);
+      T roi_width = roi_end_w - roi_start_w;
+      T roi_height = roi_end_h - roi_start_h;
+      T bin_size_h = static_cast<T>(roi_height) / static_cast<T>(pooled_height);
+      T bin_size_w = static_cast<T>(roi_width) / static_cast<T>(pooled_width);
 
-    int c_in = 0;
-    for (int c_out = 0; c_out < channels_out; ++c_out) {
-      for (int ph = 0; ph < pooled_height; ++ph) {
-        for (int pw = 0; pw < pooled_width; ++pw) {
-          int index =
-              ((n * channels_out + c_out) * pooled_height + ph) * pooled_width +
-              pw;
+      int c_in = 0;
+      for (int c_out = 0; c_out < channels_out; ++c_out) {
+        for (int ph = 0; ph < pooled_height; ++ph) {
+          for (int pw = 0; pw < pooled_width; ++pw) {
+            int index =
+                ((n * channels_out + c_out) * pooled_height + ph) * pooled_width +
+                pw;
 
-          // Do not using floor/ceil; this implementation detail is critical
-          T hstart = static_cast<T>(ph) * bin_size_h + roi_start_h;
-          T wstart = static_cast<T>(pw) * bin_size_w + roi_start_w;
+            // Do not using floor/ceil; this implementation detail is critical
+            T hstart = static_cast<T>(ph) * bin_size_h + roi_start_h;
+            T wstart = static_cast<T>(pw) * bin_size_w + roi_start_w;
 
-          // We use roi_bin_grid to sample the grid and mimic integral
-          int roi_bin_grid_h = (sampling_ratio > 0)
-              ? sampling_ratio
-              : ceil(roi_height / pooled_height);
-          int roi_bin_grid_w = (sampling_ratio > 0)
-              ? sampling_ratio
-              : ceil(roi_width / pooled_width);
-          const T count = roi_bin_grid_h * roi_bin_grid_w;
+            // We use roi_bin_grid to sample the grid and mimic integral
+            int roi_bin_grid_h = (sampling_ratio > 0)
+                ? sampling_ratio
+                : ceil(roi_height / pooled_height);
+            int roi_bin_grid_w = (sampling_ratio > 0)
+                ? sampling_ratio
+                : ceil(roi_width / pooled_width);
+            const T count = roi_bin_grid_h * roi_bin_grid_w;
 
-          const T* offset_input =
-              input + (roi_batch_ind * channels + c_in) * height * width;
+            const T* offset_input =
+                input + (roi_batch_ind * channels + c_in) * height * width;
 
-          T out_sum = 0;
-          for (int iy = 0; iy < roi_bin_grid_h; iy++) {
-            const T y = hstart +
-                static_cast<T>(iy + .5f) * bin_size_h /
-                    static_cast<T>(roi_bin_grid_h);
-            for (int ix = 0; ix < roi_bin_grid_w; ix++) {
-              const T x = wstart +
-                  static_cast<T>(ix + .5f) * bin_size_w /
-                      static_cast<T>(roi_bin_grid_w);
-              T val = bilinear_interpolate(
-                  offset_input, height, width, y, x, index);
-              out_sum += val;
+            T out_sum = 0;
+            for (int iy = 0; iy < roi_bin_grid_h; iy++) {
+              const T y = hstart +
+                  static_cast<T>(iy + .5f) * bin_size_h /
+                      static_cast<T>(roi_bin_grid_h);
+              for (int ix = 0; ix < roi_bin_grid_w; ix++) {
+                const T x = wstart +
+                    static_cast<T>(ix + .5f) * bin_size_w /
+                        static_cast<T>(roi_bin_grid_w);
+                T val = bilinear_interpolate(
+                    offset_input, height, width, y, x, index);
+                out_sum += val;
+              }
             }
-          }
 
-          out_sum /= count;
-          output[index] = out_sum;
-          channel_mapping[index] = c_in;
-          c_in++;
+            out_sum /= count;
+            output[index] = out_sum;
+            channel_mapping[index] = c_in;
+            c_in++;
+          }
         }
       }
     }
-  }
+  });
 }
 
 template <typename T>
