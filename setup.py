@@ -156,6 +156,8 @@ def get_extensions():
     print(f"  TORCHVISION_USE_FFMPEG: {use_ffmpeg}")
     use_video_codec = os.getenv("TORCHVISION_USE_VIDEO_CODEC", "1") == "1"
     print(f"  TORCHVISION_USE_VIDEO_CODEC: {use_video_codec}")
+    use_openmp = os.getenv("USE_OPENMP", "0") == "1"
+    print(f"  USE_OPEN: {use_openmp}")
 
     nvcc_flags = os.getenv("NVCC_FLAGS", "")
     print(f"  NVCC_FLAGS: {nvcc_flags}")
@@ -222,6 +224,9 @@ def get_extensions():
         define_macros += [("torchvision_EXPORTS", None)]
         define_macros += [("USE_PYTHON", None)]
         extra_compile_args["cxx"].append("/MP")
+
+    if use_openmp:
+        extra_compile_args["cxx"].append("-fopenmp")
 
     if debug_mode:
         print("Compiling in debug mode")
