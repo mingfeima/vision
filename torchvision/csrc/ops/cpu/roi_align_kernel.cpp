@@ -25,7 +25,6 @@ void roi_align_forward_kernel_impl(
     T* output) {
   // (n, c, ph, pw) is an element in the pooled output
   // can be parallelized using omp
-  // #pragma omp parallel for num_threads(32)
   at::parallel_for(0, n_rois, 1, [&](int begin, int end) {
     for (int n = begin; n < end; n++) {
       int index_n = n * channels * pooled_width * pooled_height;
@@ -62,7 +61,7 @@ void roi_align_forward_kernel_impl(
       // When the grid is empty, output zeros.
       const T count = std::max(roi_bin_grid_h * roi_bin_grid_w, 1); // e.g. = 4
 
-      // we want to precalculate indices and weights shared by all chanels,
+      // we want to precalculate indices and weights shared by all channels,
       // this is the key point of optimization
       std::vector<detail::PreCalc<T>> pre_calc(
           roi_bin_grid_h * roi_bin_grid_w * pooled_width * pooled_height);
