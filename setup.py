@@ -158,6 +158,10 @@ def get_extensions():
     print(f"  TORCHVISION_USE_VIDEO_CODEC: {use_video_codec}")
     use_openmp = os.getenv("USE_OPENMP", "0") == "1"
     print(f"  USE_OPEN: {use_openmp}")
+    use_avx2 = os.getenv('USE_AVX2', '0') == '1'
+    print(f"  USE_AVX2: {use_avx2}")
+    use_avx512 = os.getenv('USE_AVX512', '0') == '1'
+    print(f"  USE_AVX512: {use_avx512}")
 
     nvcc_flags = os.getenv("NVCC_FLAGS", "")
     print(f"  NVCC_FLAGS: {nvcc_flags}")
@@ -227,6 +231,15 @@ def get_extensions():
 
     if use_openmp:
         extra_compile_args["cxx"].append("-fopenmp")
+
+    if use_avx2:
+        extra_compile_args["cxx"].append("-O3")
+        extra_compile_args["cxx"].append("-mavx2")
+
+    if use_avx512:
+        extra_compile_args["cxx"].append("-O3")
+        extra_compile_args["cxx"].append("-march=skylake-avx512")
+        extra_compile_args["cxx"].append("-mavx512f")
 
     if debug_mode:
         print("Compiling in debug mode")

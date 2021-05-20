@@ -10,6 +10,92 @@ namespace ops {
 namespace {
 
 template <typename T>
+inline void roi_align_single_framework_forward(
+    const T* input,
+    const int count,
+    int channels,
+    int height,
+    int width,
+    int pooled_height,
+    int pooled_width,
+    int roi_bin_grid_h,
+    int roi_bin_grid_w,
+    const std::vector<detail::PreCalc<T>>& pre_calc,
+    T* output) {
+  for (int c = 0; c < channels; c++) {
+    const T* offset_input = input + c * height * width;
+    int pre_calc_index = 0;
+
+    for (int ph = 0; ph < pooled_height; ph++) {
+      for (int pw = 0; pw < pooled_width; pw++) {
+        int index = c * pooled_height * pooled_width + ph * pooled_width + pw;
+
+        T output_val = 0.;
+        for (int iy = 0; iy < roi_bin_grid_h; iy++) {
+          for (int ix = 0; ix < roi_bin_grid_w; ix++) {
+            detail::PreCalc<T> pc = pre_calc[pre_calc_index];
+            output_val += pc.w1 * offset_input[pc.pos1] +
+                    pc.w2 * offset_input[pc.pos2] +
+                    pc.w3 * offset_input[pc.pos3] + pc.w4 * offset_input[pc.pos4];
+
+            pre_calc_index += 1;
+          }
+        }
+        output_val /= count; // Average pooling
+
+        output[index] = output_val;
+      } // for pw
+    } // for ph
+  } // for c
+}
+
+template <typename T>
+inline void roi_align_single_framework_channels_last_forward(
+    const T* input,
+    const int count,
+    int channels,
+    int height,
+    int width,
+    int pooled_height,
+    int pooled_width,
+    int roi_bin_grid_h,
+    int roi_bin_grid_w,
+    const std::vector<detail::PreCalc<T>>& pre_calc,
+    T* output) {
+  // for 'normal' size of channels, should be L1 fit;
+  // otherwise consider blocking on channels.
+  int pre_calc_index = 0;
+  for (int ph = 0; ph < pooled_height; ph++) {
+    for (int pw = 0; pw < pooled_width; pw++) {
+      T* out = output + (ph * pooled_width + pw) * channels;
+
+      // pass I: do accumulation
+      for (int iy = 0; iy < roi_bin_grid_h; iy++) {
+        for (int ix = 0; ix < roi_bin_grid_w; ix++) {
+          detail::PreCalc<T> pc = pre_calc[pre_calc_index];
+          const T* in1 = input + pc.pos1 * channels;
+          const T* in2 = input + pc.pos2 * channels;
+          const T* in3 = input + pc.pos3 * channels;
+          const T* in4 = input + pc.pos4 * channels;
+
+          #pragma omp simd
+          for (int c = 0; c < channels; c++) {
+            out[c] += pc.w1 * in1[c] + pc.w2 * in2[c] + pc.w3 * in3[c] + pc.w4 * in4[c];
+          }
+          pre_calc_index += 1;
+        }
+      }
+
+      // pass II: do average
+      #pragma omp simd
+      for (int c = 0; c < channels; c++) {
+        out[c] /= count;
+      }
+    } // for pw
+  } // for ph
+}
+
+template <typename T>
 void roi_align_forward_kernel_impl(
     int n_rois,
     const T* input,
@@ -22,13 +108,12 @@ void roi_align_forward_kernel_impl(
     int sampling_ratio,
     bool aligned,
     const T* rois,
-    T* output) {
+    T* output,
+    bool is_channels_last) {
   // (n, c, ph, pw) is an element in the pooled output
   // can be parallelized using omp
   at::parallel_for(0, n_rois, 1, [&](int begin, int end) {
     for (int n = begin; n < end; n++) {
-      int index_n = n * channels * pooled_width * pooled_height;
-
       const T* offset_rois = rois + n * 5;
       int roi_batch_ind = offset_rois[0];
 
@@ -78,33 +163,33 @@ void roi_align_forward_kernel_impl(
           roi_bin_grid_w,
           pre_calc);
 
-      for (int c = 0; c < channels; c++) {
-        int index_n_c = index_n + c * pooled_width * pooled_height;
-        const T* offset_input =
-            input + (roi_batch_ind * channels + c) * height * width;
-        int pre_calc_index = 0;
-
-        for (int ph = 0; ph < pooled_height; ph++) {
-          for (int pw = 0; pw < pooled_width; pw++) {
-            int index = index_n_c + ph * pooled_width + pw;
-
-            T output_val = 0.;
-            for (int iy = 0; iy < roi_bin_grid_h; iy++) {
-              for (int ix = 0; ix < roi_bin_grid_w; ix++) {
-                detail::PreCalc<T> pc = pre_calc[pre_calc_index];
-                output_val += pc.w1 * offset_input[pc.pos1] +
-                    pc.w2 * offset_input[pc.pos2] +
-                    pc.w3 * offset_input[pc.pos3] + pc.w4 * offset_input[pc.pos4];
-
-                pre_calc_index += 1;
-              }
-            }
-            output_val /= count; // Average pooling
-
-            output[index] = output_val;
-          } // for pw
-        } // for ph
-      } // for c
+      if (is_channels_last) {
+        roi_align_single_framework_channels_last_forward(
+            input + roi_batch_ind * height * width * channels,
+            count,
+            channels,
+            height,
+            width,
+            pooled_height,
+            pooled_width,
+            roi_bin_grid_h,
+            roi_bin_grid_w,
+            pre_calc,
+            output + n * pooled_width * pooled_height * channels);
+      } else {
+        roi_align_single_framework_forward(
+            input + roi_batch_ind * channels * height * width,
+            count,
+            channels,
+            height,
+            width,
+            pooled_height,
+            pooled_width,
+            roi_bin_grid_h,
+            roi_bin_grid_w,
+            pre_calc,
+            output + n * channels * pooled_width * pooled_height);
+      }
     } // for n
   });
 }
@@ -303,13 +388,15 @@ at::Tensor roi_align_forward_kernel(
   auto height = input.size(2);
   auto width = input.size(3);
 
-  at::Tensor output = at::zeros(
-      {num_rois, channels, pooled_height, pooled_width}, input.options());
+  auto memory_format = input.suggest_memory_format();
+  bool is_channels_last = memory_format == at::MemoryFormat::ChannelsLast;
+  at::Tensor output = at::empty({0}, input.options());
+  output.resize_({num_rois, channels, pooled_height, pooled_width}, memory_format).zero_();
 
   if (output.numel() == 0)
     return output;
 
-  auto input_ = input.contiguous(), rois_ = rois.contiguous();
+  auto input_ = input.contiguous(memory_format), rois_ = rois.contiguous();
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
       input.scalar_type(), "roi_align_forward_kernel", [&] {
         roi_align_forward_kernel_impl<scalar_t>(
@@ -324,7 +411,8 @@ at::Tensor roi_align_forward_kernel(
             sampling_ratio,
             aligned,
             rois_.data_ptr<scalar_t>(),
-            output.data_ptr<scalar_t>());
+            output.data_ptr<scalar_t>(),
+            is_channels_last);
       });
   return output;
 }
