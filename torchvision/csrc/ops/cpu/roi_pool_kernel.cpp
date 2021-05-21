@@ -86,6 +86,78 @@ void roi_pool_forward_kernel_impl(
 }
 
 template <typename T>
+void roi_pool_forward_channels_last_kernel_impl(
+    const T* input,
+    const T spatial_scale,
+    int channels,
+    int height,
+    int width,
+    int pooled_height,
+    int pooled_width,
+    const T* rois,
+    int num_rois,
+    T* output,
+    int* argmax_data) {
+  at::parallel_for(0, num_rois, 1, [&](int begin, int end) {
+    for (int n = begin; n < end; ++n) {
+      const T* offset_rois = rois + n * 5;
+      int roi_batch_ind = offset_rois[0];
+      int roi_start_w = round(offset_rois[1] * spatial_scale);
+      int roi_start_h = round(offset_rois[2] * spatial_scale);
+      int roi_end_w = round(offset_rois[3] * spatial_scale);
+      int roi_end_h = round(offset_rois[4] * spatial_scale);
+
+      // Force malformed ROIs to be 1x1
+      int roi_width = std::max(roi_end_w - roi_start_w + 1, 1);
+      int roi_height = std::max(roi_end_h - roi_start_h + 1, 1);
+      T bin_size_h = static_cast<T>(roi_height) / static_cast<T>(pooled_height);
+      T bin_size_w = static_cast<T>(roi_width) / static_cast<T>(pooled_width);
+
+      for (int ph = 0; ph < pooled_height; ++ph) {
+        for (int pw = 0; pw < pooled_width; ++pw) {
+          int hstart = static_cast<int>(floor(static_cast<T>(ph) * bin_size_h));
+          int wstart = static_cast<int>(floor(static_cast<T>(pw) * bin_size_w));
+          int hend = static_cast<int>(ceil(static_cast<T>(ph + 1) * bin_size_h));
+          int wend = static_cast<int>(ceil(static_cast<T>(pw + 1) * bin_size_w));
+
+          // Add roi offsets and clip to input boundaries
+          hstart = std::min(std::max(hstart + roi_start_h, 0), height);
+          hend = std::min(std::max(hend + roi_start_h, 0), height);
+          wstart = std::min(std::max(wstart + roi_start_w, 0), width);
+          wend = std::min(std::max(wend + roi_start_w, 0), width);
+          bool is_empty = (hend <= hstart) || (wend <= wstart);
+
+          // local pointers
+          int index = (n * pooled_height * pooled_width + ph * pooled_width + pw) * channels;
+          T* out = output + index;
+          int* argmax = argmax_data + index;
+          const T* input_offset = input + roi_batch_ind * height * width * channels;
+
+          #pragma omp simd
+          for (int c = 0; c < channels; c++) {
+            out[c] = is_empty ? 0 : -FLT_MAX;
+            argmax[c] = -1;
+          }
+
+          for (int h = hstart; h < hend; ++h) {
+            for (int w = wstart; w < wend; ++w) {
+              int input_index = h * width + w;
+              const T* in = input_offset + input_index * channels;
+
+              #pragma omp simd
+              for (int c = 0; c < channels; c++) {
+                out[c] = in[c] > out[c] ? in[c] : out[c];
+                argmax[c] = in[c] > out[c] ? input_index : argmax[c];
+              }
+            }
+          }
+        }
+      }
+    }
+  });
+}
+
+template <typename T>
 void roi_pool_backward_kernel_impl(
     const T* grad_output,
     const int* argmax_data,
@@ -147,31 +219,47 @@ std::tuple<at::Tensor, at::Tensor> roi_pool_forward_kernel(
   int height = input.size(2);
   int width = input.size(3);
 
-  at::Tensor output = at::zeros(
-      {num_rois, channels, pooled_height, pooled_width}, input.options());
-  at::Tensor argmax = at::zeros(
-      {num_rois, channels, pooled_height, pooled_width},
-      input.options().dtype(at::kInt));
+  auto memory_format = input.suggest_memory_format();
+  bool is_channels_last = memory_format == at::MemoryFormat::ChannelsLast;
+  at::Tensor output = at::empty({0}, input.options());
+  output.resize_({num_rois, channels, pooled_height, pooled_width}, memory_format).zero_();
+  at::Tensor argmax = at::empty({0}, input.options().dtype(at::kInt));
+  argmax.resize_({num_rois, channels, pooled_height, pooled_width}, memory_format).zero_();
 
   if (output.numel() == 0) {
     return std::make_tuple(output, argmax);
   }
 
-  auto input_ = input.contiguous(), rois_ = rois.contiguous();
+  auto input_ = input.contiguous(memory_format), rois_ = rois.contiguous();
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
       input.scalar_type(), "roi_pool_forward_kernel", [&] {
-        roi_pool_forward_kernel_impl<scalar_t>(
-            input_.data_ptr<scalar_t>(),
-            spatial_scale,
-            channels,
-            height,
-            width,
-            pooled_height,
-            pooled_width,
-            rois_.data_ptr<scalar_t>(),
-            num_rois,
-            output.data_ptr<scalar_t>(),
-            argmax.data_ptr<int>());
+        if (is_channels_last) {
+          roi_pool_forward_channels_last_kernel_impl<scalar_t>(
+              input_.data_ptr<scalar_t>(),
+              spatial_scale,
+              channels,
+              height,
+              width,
+              pooled_height,
+              pooled_width,
+              rois_.data_ptr<scalar_t>(),
+              num_rois,
+              output.data_ptr<scalar_t>(),
+              argmax.data_ptr<int>());
+        } else {
+          roi_pool_forward_kernel_impl<scalar_t>(
+              input_.data_ptr<scalar_t>(),
+              spatial_scale,
+              channels,
+              height,
+              width,
+              pooled_height,
+              pooled_width,
+              rois_.data_ptr<scalar_t>(),
+              num_rois,
+              output.data_ptr<scalar_t>(),
+              argmax.data_ptr<int>());
+        }
       });
   return std::make_tuple(output, argmax);
 }
