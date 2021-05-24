@@ -61,6 +61,72 @@ T bilinear_interpolate(
   return val;
 }
 
+// Channels Last:
+//   1. bilinear interpolation upon input lanes,
+//   2. accumulate result on output lane.
+template <typename T>
+void bilinear_interpolate_acc(
+    const T* input,
+    int height,
+    int width,
+    int pooled_height,
+    int pooled_width,
+    int channels,
+    int channels_out,
+    T y,
+    T x,
+    int c_in,
+    T* output) {
+  if (y < -1.0 || y > height || x < -1.0 || x > width) {
+    return;
+  }
+
+  if (y <= 0)
+    y = 0;
+  if (x <= 0)
+    x = 0;
+
+  int y_low = (int)y;
+  int x_low = (int)x;
+  int y_high;
+  int x_high;
+
+  if (y_low >= height - 1) {
+    y_high = y_low = height - 1;
+    y = (T)y_low;
+  } else {
+    y_high = y_low + 1;
+  }
+
+  if (x_low >= width - 1) {
+    x_high = x_low = width - 1;
+    x = (T)x_low;
+  } else {
+    x_high = x_low + 1;
+  }
+
+  T ly = y - y_low;
+  T lx = x - x_low;
+  T hy = 1. - ly, hx = 1. - lx;
+
+  // input plane size: [height, width, channels_out, pooled_height, pooled_width]
+  const T* v1 = input + (y_low * width + x_low) * channels;
+  const T* v2 = input + (y_low * width + x_high) * channels;
+  const T* v3 = input + (y_high * width + x_low) * channels;
+  const T* v4 = input + (y_high * width + x_high) * channels;
+  T w1 = hy * hx, w2 = hy * lx, w3 = ly * hx, w4 = ly * lx;
+
+  // TODO: gather is slow, try to transpose input channel dimension to [pooled_height, pooled_weight, *]
+  int image_size = pooled_height * pooled_width;
+  #pragma omp simd
+  for (int c_out = 0; c_out < channels_out; ++c_out) {
+    output[c_out] += w1 * v1[c_out * image_size + c_in] +
+                 w2 * v2[c_out * image_size + c_in] +
+                 w3 * v3[c_out * image_size + c_in] +
+                 w4 * v4[c_out * image_size + c_in];
+  }
+}
+
 template <typename T>
 void ps_roi_align_forward_kernel_impl(
     int num_rois,
@@ -137,6 +203,74 @@ void ps_roi_align_forward_kernel_impl(
             channel_mapping[index] = c_in;
             c_in++;
           }
+        }
+      }
+    }
+  });
+}
+
+template <typename T>
+void ps_roi_align_forward_channels_last_kernel_impl(
+    int num_rois,
+    const T* input,
+    const T spatial_scale,
+    int channels,
+    int height,
+    int width,
+    int pooled_height,
+    int pooled_width,
+    int sampling_ratio,
+    const T* rois,
+    int channels_out,
+    T* output,
+    int* channel_mapping) {
+  at::parallel_for(0, num_rois, 1, [&](int begin, int end) {
+    for (int n = begin; n < end; n++) {
+      const T* offset_rois = rois + n * 5;
+      int roi_batch_ind = offset_rois[0];
+
+      T roi_start_w = offset_rois[1] * spatial_scale - static_cast<T>(0.5);
+      T roi_start_h = offset_rois[2] * spatial_scale - static_cast<T>(0.5);
+      T roi_end_w = offset_rois[3] * spatial_scale - static_cast<T>(0.5);
+      T roi_end_h = offset_rois[4] * spatial_scale - static_cast<T>(0.5);
+
+      T roi_width = roi_end_w - roi_start_w;
+      T roi_height = roi_end_h - roi_start_h;
+      T bin_size_h = static_cast<T>(roi_height) / static_cast<T>(pooled_height);
+      T bin_size_w = static_cast<T>(roi_width) / static_cast<T>(pooled_width);
+
+      int roi_bin_grid_h = (sampling_ratio > 0)
+          ? sampling_ratio
+          : ceil(roi_height / pooled_height);
+      int roi_bin_grid_w = (sampling_ratio > 0)
+          ? sampling_ratio
+          : ceil(roi_width / pooled_width);
+      const T count = roi_bin_grid_h * roi_bin_grid_w;
+
+      const T* offset_input = input + roi_batch_ind * height * width * channels;
+
+      int c_in = 0;
+      for (int ph = 0; ph < pooled_height; ++ph) {
+        for (int pw = 0; pw < pooled_width; ++pw) {
+          int index = (n * pooled_height * pooled_width + ph * pooled_width + pw) * channels_out;
+          T hstart = static_cast<T>(ph) * bin_size_h + roi_start_h;
+          T wstart = static_cast<T>(pw) * bin_size_w + roi_start_w;
+
+          for (int iy = 0; iy < roi_bin_grid_h; iy++) {
+            const T y = hstart + static_cast<T>(iy + .5f) * bin_size_h / static_cast<T>(roi_bin_grid_h);
+            for (int ix = 0; ix < roi_bin_grid_w; ix++) {
+              const T x = wstart + static_cast<T>(ix + .5f) * bin_size_w / static_cast<T>(roi_bin_grid_w);
+
+              bilinear_interpolate_acc(
+                offset_input, height, width, pooled_height, pooled_width, channels, channels_out, y, x, c_in, output + index);
+            }
+          }
+
+          for (int c_out = 0; c_out < channels_out; ++c_out) {
+            output[index + c_out] /= count;
+            channel_mapping[index + c_out] = c_out * pooled_height * pooled_width + c_in;
+          }
+          c_in++;
         }
       }
     }
@@ -331,32 +465,51 @@ std::tuple<at::Tensor, at::Tensor> ps_roi_align_forward_kernel(
       "input channels must be a multiple of pooling height * pooling width");
   int channels_out = channels / (pooled_height * pooled_width);
 
-  auto output = at::zeros(
-      {num_rois, channels_out, pooled_height, pooled_width}, input.options());
-  auto channel_mapping =
-      at::zeros(output.sizes(), input.options().dtype(at::kInt));
+  auto memory_format = input.suggest_memory_format();
+  bool is_channels_last = memory_format == at::MemoryFormat::ChannelsLast;
+  at::Tensor output = at::empty({0}, input.options());
+  output.resize_({num_rois, channels_out, pooled_height, pooled_width}, memory_format).zero_();
+  at::Tensor channel_mapping = at::empty({0}, input.options().dtype(at::kInt));
+  channel_mapping.resize_({num_rois, channels_out, pooled_height, pooled_width}, memory_format).zero_();
 
   if (output.numel() == 0) {
     return std::make_tuple(output, channel_mapping);
   }
 
-  auto input_ = input.contiguous(), rois_ = rois.contiguous();
+  auto input_ = input.contiguous(memory_format), rois_ = rois.contiguous();
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
       input.scalar_type(), "ps_roi_align_forward_kernel", [&] {
-        ps_roi_align_forward_kernel_impl<scalar_t>(
-            num_rois,
-            input_.data_ptr<scalar_t>(),
-            spatial_scale,
-            channels,
-            height,
-            width,
-            pooled_height,
-            pooled_width,
-            sampling_ratio,
-            rois_.data_ptr<scalar_t>(),
-            channels_out,
-            output.data_ptr<scalar_t>(),
-            channel_mapping.data_ptr<int>());
+        if (is_channels_last) {
+          ps_roi_align_forward_channels_last_kernel_impl<scalar_t>(
+              num_rois,
+              input_.data_ptr<scalar_t>(),
+              spatial_scale,
+              channels,
+              height,
+              width,
+              pooled_height,
+              pooled_width,
+              sampling_ratio,
+              rois_.data_ptr<scalar_t>(),
+              channels_out,
+              output.data_ptr<scalar_t>(),
+              channel_mapping.data_ptr<int>());
+        } else {
+          ps_roi_align_forward_kernel_impl<scalar_t>(
+              num_rois,
+              input_.data_ptr<scalar_t>(),
+              spatial_scale,
+              channels,
+              height,
+              width,
+              pooled_height,
+              pooled_width,
+              sampling_ratio,
+              rois_.data_ptr<scalar_t>(),
+              channels_out,
+              output.data_ptr<scalar_t>(),
+              channel_mapping.data_ptr<int>());
+        }
       });
   return std::make_tuple(output, channel_mapping);
 }
