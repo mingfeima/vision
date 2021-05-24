@@ -85,6 +85,83 @@ void ps_roi_pool_forward_kernel_impl(
 }
 
 template <typename T>
+void ps_roi_pool_forward_channels_last_kernel_impl(
+    const T* input,
+    const T spatial_scale,
+    int channels,
+    int height,
+    int width,
+    int pooled_height,
+    int pooled_width,
+    const T* rois,
+    int channels_out,
+    int num_rois,
+    T* output,
+    int* channel_mapping) {
+  at::parallel_for(0, num_rois, 1, [&] (int begin, int end) {
+    for (int n = begin; n < end; ++n) {
+      const T* offset_rois = rois + n * 5;
+      int roi_batch_ind = offset_rois[0];
+      int roi_start_w = round(offset_rois[1] * spatial_scale);
+      int roi_start_h = round(offset_rois[2] * spatial_scale);
+      int roi_end_w = round(offset_rois[3] * spatial_scale);
+      int roi_end_h = round(offset_rois[4] * spatial_scale);
+
+      // Force too small ROIs to be 1x1
+      int roi_width = std::max(roi_end_w - roi_start_w, 1);
+      int roi_height = std::max(roi_end_h - roi_start_h, 1);
+      T bin_size_h = static_cast<T>(roi_height) / static_cast<T>(pooled_height);
+      T bin_size_w = static_cast<T>(roi_width) / static_cast<T>(pooled_width);
+
+      const T* offset_input = input + roi_batch_ind * height * width * channels;
+
+      int c_in = 0;
+      for (int ph = 0; ph < pooled_height; ++ph) {
+        for (int pw = 0; pw < pooled_width; ++pw) {
+          int hstart = static_cast<int>(floor(static_cast<T>(ph) * bin_size_h));
+          int wstart = static_cast<int>(floor(static_cast<T>(pw) * bin_size_w));
+          int hend = static_cast<int>(ceil(static_cast<T>(ph + 1) * bin_size_h));
+          int wend = static_cast<int>(ceil(static_cast<T>(pw + 1) * bin_size_w));
+
+          hstart = std::min(std::max(hstart + roi_start_h, 0), height - 1);
+          hend = std::min(std::max(hend + roi_start_h, 0), height - 1);
+          wstart = std::min(std::max(wstart + roi_start_w, 0), width - 1);
+          wend = std::min(std::max(wend + roi_start_w, 0), width - 1);
+          bool is_empty = (hend <= hstart) || (wend <= wstart);
+
+          int index = (n * pooled_height * pooled_width + ph * pooled_width + pw) * channels_out;
+          for (int h = hstart; h < hend; ++h) {
+            for (int w = wstart; w < wend; ++w) {
+              #pragma omp simd
+              for (int c_out = 0; c_out < channels_out; ++c_out) {
+                int input_index = (h * width + w) * channels + c_out * pooled_height * pooled_width + c_in;
+                output[index + c_out] += offset_input[input_index];
+              }
+            }
+          }
+
+          T bin_area = (hend - hstart) * (wend - wstart);
+          if (is_empty) {
+            #pragma omp simd
+            for (int c_out = 0; c_out < channels_out; ++c_out) {
+              output[index + c_out] = static_cast<T>(0);
+              channel_mapping[index + c_out] = c_out * pooled_height * pooled_width + c_in;
+            }
+          } else {
+            #pragma omp simd
+            for (int c_out = 0; c_out < channels_out; ++c_out) {
+              output[index + c_out] /= bin_area;
+              channel_mapping[index + c_out] = c_out * pooled_height * pooled_width + c_in;
+            }
+          }
+          c_in++;
+        }  
+      }
+    }
+  }); 
+}
+
+template <typename T>
 void ps_roi_pool_backward_kernel_impl(
     const T* grad_output,
     const int* channel_mapping,
@@ -176,32 +253,50 @@ std::tuple<at::Tensor, at::Tensor> ps_roi_pool_forward_kernel(
       "input channels must be a multiple of pooling height * pooling width");
   int channels_out = channels / (pooled_height * pooled_width);
 
-  auto output = at::zeros(
-      {num_rois, channels_out, pooled_height, pooled_width}, input.options());
-  auto channel_mapping =
-      at::zeros(output.sizes(), input.options().dtype(at::kInt));
+  auto memory_format = input.suggest_memory_format();
+  bool is_channels_last = memory_format == at::MemoryFormat::ChannelsLast;
+  at::Tensor output = at::empty({0}, input.options());
+  output.resize_({num_rois, channels_out, pooled_height, pooled_width}, memory_format).zero_();
+  at::Tensor channel_mapping = at::empty({0}, input.options().dtype(at::kInt));
+  channel_mapping.resize_({num_rois, channels_out, pooled_height, pooled_width}, memory_format).zero_();
 
   auto output_size = output.numel();
   if (output_size == 0) {
     return std::make_tuple(output, channel_mapping);
   }
 
-  auto input_ = input.contiguous(), rois_ = rois.contiguous();
+  auto input_ = input.contiguous(memory_format), rois_ = rois.contiguous();
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
       input.scalar_type(), "ps_roi_pool_forward_kernel", [&] {
-        ps_roi_pool_forward_kernel_impl<scalar_t>(
-            input_.data_ptr<scalar_t>(),
-            spatial_scale,
-            channels,
-            height,
-            width,
-            pooled_height,
-            pooled_width,
-            rois_.data_ptr<scalar_t>(),
-            channels_out,
-            num_rois,
-            output.data_ptr<scalar_t>(),
-            channel_mapping.data_ptr<int>());
+        if (is_channels_last) {
+          ps_roi_pool_forward_channels_last_kernel_impl<scalar_t>(
+              input_.data_ptr<scalar_t>(),
+              spatial_scale,
+              channels,
+              height,
+              width,
+              pooled_height,
+              pooled_width,
+              rois_.data_ptr<scalar_t>(),
+              channels_out,
+              num_rois,
+              output.data_ptr<scalar_t>(),
+              channel_mapping.data_ptr<int>());
+        } else {
+          ps_roi_pool_forward_kernel_impl<scalar_t>(
+              input_.data_ptr<scalar_t>(),
+              spatial_scale,
+              channels,
+              height,
+              width,
+              pooled_height,
+              pooled_width,
+              rois_.data_ptr<scalar_t>(),
+              channels_out,
+              num_rois,
+              output.data_ptr<scalar_t>(),
+              channel_mapping.data_ptr<int>());
+        }
       });
   return std::make_tuple(output, channel_mapping);
 }
